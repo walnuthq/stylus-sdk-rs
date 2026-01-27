@@ -130,6 +130,8 @@ pub struct ContractInfo {
     pub debug_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lib_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
 }
 
 /// Trace request to another environment
@@ -261,6 +263,7 @@ impl SoldbBridgeClient {
             name: name.to_string(),
             debug_dir: None,
             lib_path: lib_path.map(String::from),
+            project_path: None,
         };
         self.register_contract(&contract)
     }
@@ -271,6 +274,7 @@ impl SoldbBridgeClient {
         address: &str,
         name: &str,
         debug_dir: Option<&str>,
+        project_path: &str,
     ) -> Result<()> {
         let contract = ContractInfo {
             address: address.to_string(),
@@ -278,6 +282,7 @@ impl SoldbBridgeClient {
             name: name.to_string(),
             debug_dir: debug_dir.map(String::from),
             lib_path: None,
+            project_path: Some(project_path.to_string()),
         };
         self.register_contract(&contract)
     }
@@ -375,6 +380,61 @@ impl SoldbBridgeClient {
     }
 }
 
+/// Solidity contract info for cross-env tracing
+#[derive(Debug, Clone)]
+pub struct SolidityContractInfo {
+    pub name: String,
+    pub debug_dir: String,
+    pub project_path: Option<String>,
+}
+
+/// Configuration for cross-environment tracing
+#[derive(Debug, Clone)]
+pub struct CrossEnvConfig {
+    pub bridge_url: String,
+    pub solidity_contracts: HashMap<String, SolidityContractInfo>,
+    pub tx_hash: Option<String>,
+    pub rpc_endpoint: String,
+    pub caller_address: Option<String>,
+    pub block_number: Option<u64>,
+}
+
+/// Global cross-env configuration
+static mut CROSS_ENV_CONFIG: Option<CrossEnvConfig> = None;
+
+/// Set the cross-environment configuration
+pub fn set_cross_env_config(config: CrossEnvConfig) {
+    unsafe {
+        CROSS_ENV_CONFIG = Some(config);
+    }
+}
+
+/// Get the cross-environment configuration
+pub fn get_cross_env_config() -> Option<&'static CrossEnvConfig> {
+    unsafe { CROSS_ENV_CONFIG.as_ref() }
+}
+
+/// Check if an address is a registered Solidity contract
+pub fn is_solidity_contract(address: &str) -> bool {
+    let normalized = address.to_lowercase();
+    unsafe {
+        CROSS_ENV_CONFIG
+            .as_ref()
+            .map(|c| c.solidity_contracts.contains_key(&normalized))
+            .unwrap_or(false)
+    }
+}
+
+/// Get Solidity contract info by address
+pub fn get_solidity_contract(address: &str) -> Option<&'static SolidityContractInfo> {
+    let normalized = address.to_lowercase();
+    unsafe {
+        CROSS_ENV_CONFIG
+            .as_ref()
+            .and_then(|c| c.solidity_contracts.get(&normalized))
+    }
+}
+
 /// Global bridge client instance
 static mut BRIDGE_CLIENT: Option<SoldbBridgeClient> = None;
 
@@ -420,6 +480,57 @@ pub fn create_trace_request(
     }
 }
 
+/// Request EVM trace via the bridge server and wait for completion
+pub fn request_and_wait_evm_trace(
+    target_address: &str,
+    calldata: &str,
+    value: u64,
+    caller: Option<&str>,
+    depth: u32,
+    parent_call_id: Option<u64>,
+) -> Result<Option<CrossEnvTrace>> {
+    let config = get_cross_env_config().ok_or_else(|| eyre::eyre!("Cross-env config not set"))?;
+
+    let client = SoldbBridgeClient::new(Some(&config.bridge_url));
+
+    let request = TraceRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        transaction_hash: config.tx_hash.clone(),
+        block_number: None,
+        target_address: target_address.to_string(),
+        caller_address: caller.map(String::from),
+        calldata: calldata.to_string(),
+        value,
+        depth,
+        parent_call_id,
+        parent_trace_id: None,
+        source_environment: "stylus".to_string(),
+    };
+
+    let response = client.request_evm_trace(&request)?;
+
+    match response.status.as_str() {
+        "success" => Ok(response.trace),
+        "pending" => {
+            // Poll for completion
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(Some(trace)) = client.get_trace(&request.request_id) {
+                    return Ok(Some(trace));
+                }
+            }
+            bail!("Timeout waiting for EVM trace")
+        }
+        "error" => {
+            bail!(
+                "EVM trace request failed: {}",
+                response.error_message.unwrap_or_default()
+            )
+        }
+        _ => bail!("Unknown trace response status: {}", response.status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +543,7 @@ mod tests {
             name: "TestContract".to_string(),
             debug_dir: None,
             lib_path: Some("/path/to/lib.dylib".to_string()),
+            project_path: None,
         };
 
         let json = serde_json::to_string(&contract).unwrap();

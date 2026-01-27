@@ -328,8 +328,8 @@ fn find_shared_library_in_path(project: &Path, extension: &str) -> eyre::Result<
 
     // Try project-local target first, then workspace root target
     let local_target = project.join(format!("target/{triple}/debug/"));
-    let workspace_target = find_workspace_root(project)
-        .map(|root| root.join(format!("target/{triple}/debug/")));
+    let workspace_target =
+        find_workspace_root(project).map(|root| root.join(format!("target/{triple}/debug/")));
 
     let so_dir = if local_target.exists() {
         local_target
@@ -528,8 +528,12 @@ async fn exec_inner(args: Args) -> eyre::Result<()> {
     }
 
     let provider = args.provider.build_provider().await?;
+    let tx = args
+        .trace
+        .tx
+        .ok_or_else(|| eyre::eyre!("missing tx hash - use --tx <HASH>"))?;
 
-    let trace = Trace::new(args.trace.tx, &args.trace.config, &provider).await?;
+    let trace = Trace::new(tx, &args.trace.config, &provider).await?;
 
     // Create contract registry and build all contracts
     let mut registry = ContractRegistry::new(args.contracts.clone(), args.addr_solidity.clone())?;
