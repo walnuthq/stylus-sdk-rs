@@ -77,6 +77,11 @@ pub struct CrossEnvCall {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Error message describing why the call failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Whether this frame was reverted (alternative error indicator)
+    #[serde(default)]
     pub call_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<u64>,
@@ -114,6 +119,9 @@ pub struct CrossEnvTrace {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Error message describing why the trace/transaction failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 fn default_protocol_version() -> String {
@@ -510,7 +518,12 @@ pub fn request_and_wait_evm_trace(
     let response = client.request_evm_trace(&request)?;
 
     match response.status.as_str() {
-        "success" => Ok(response.trace),
+        "success" | "error" => {
+            // "success" = transaction succeeded
+            // "error" = transaction reverted (but trace is still valid!)
+            // In both cases, return the trace if available
+            Ok(response.trace)
+        }
         "pending" => {
             // Poll for completion
             for _ in 0..30 {
@@ -520,12 +533,6 @@ pub fn request_and_wait_evm_trace(
                 }
             }
             bail!("Timeout waiting for EVM trace")
-        }
-        "error" => {
-            bail!(
-                "EVM trace request failed: {}",
-                response.error_message.unwrap_or_default()
-            )
         }
         _ => bail!("Unknown trace response status: {}", response.status),
     }

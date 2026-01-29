@@ -1319,6 +1319,7 @@ dependencies = [
  "serde_json",
  "simple_logger",
  "stylus-tools",
+ "tempfile",
  "tokio",
  "uuid 1.18.1",
 ]

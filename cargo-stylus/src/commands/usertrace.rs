@@ -189,13 +189,25 @@ fn merge_cross_env_traces(lldb_trace_path: &str) -> eyre::Result<bool> {
     let lldb_json = std::fs::read_to_string(lldb_trace_path)?;
     let cross_env_json = std::fs::read_to_string(cross_env_path)?;
 
-    let mut lldb_trace: Vec<serde_json::Value> = serde_json::from_str(&lldb_json)?;
+    let lldb_parsed: serde_json::Value = serde_json::from_str(&lldb_json)?;
+    let mut lldb_trace = lldb_parsed
+        .get("calls")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| {
+            eyre::eyre!("invalid LLDB trace format: expected object with 'calls' field")
+        })?;
+
     let cross_env_traces: Vec<serde_json::Value> = serde_json::from_str(&cross_env_json)?;
 
     if cross_env_traces.is_empty() {
         let _ = std::fs::remove_file(cross_env_path);
         return Ok(false);
     }
+
+    // Track if any cross-env trace failed (for final status and error header)
+    let mut any_trace_failed = false;
+    let mut first_error_message: Option<String> = None;
 
     // Find max call_id in LLDB trace
     let mut max_call_id: u64 = lldb_trace
@@ -291,6 +303,28 @@ fn merge_cross_env_traces(lldb_trace_path: &str) -> eyre::Result<bool> {
             id_map.insert(orig_id, max_call_id);
         }
 
+        // Check trace-level error (applies to all calls in this trace)
+        let trace_success = trace
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Track if this trace failed
+        if !trace_success {
+            any_trace_failed = true;
+            // Try to find the first error message from calls
+            if first_error_message.is_none() {
+                for evm_call in &evm_calls {
+                    if let Some(err) = evm_call.get("error").and_then(|v| v.as_str()) {
+                        if !err.is_empty() {
+                            first_error_message = Some(err.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Insert EVM calls with correct hierarchy
         for evm_call in &evm_calls {
             let orig_id = evm_call
@@ -313,6 +347,15 @@ fn merge_cross_env_traces(lldb_trace_path: &str) -> eyre::Result<bool> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
 
+            // Extract source location if available
+            let (file, line) = if let Some(src_loc) = evm_call.get("source_location") {
+                let f = src_loc.get("file").and_then(|v| v.as_str()).unwrap_or("");
+                let l = src_loc.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+                (f.to_string(), l)
+            } else {
+                (String::new(), 0)
+            };
+
             // Build args array from EVM call args
             let mut args_array = Vec::new();
             if let Some(args) = evm_call.get("args").and_then(|a| a.as_array()) {
@@ -327,23 +370,76 @@ fn merge_cross_env_traces(lldb_trace_path: &str) -> eyre::Result<bool> {
                 }
             }
 
-            let new_entry = serde_json::json!({
+            // Check if this EVM call failed - check multiple possible fields
+            let call_success = evm_call
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            // error can be a string (error message) or a boolean
+            let has_error_field = evm_call
+                .get("error")
+                .map(|v| {
+                    // Check if error is a non-empty string or true boolean
+                    v.as_str().map(|s| !s.is_empty()).unwrap_or(false)
+                        || v.as_bool().unwrap_or(false)
+                })
+                .unwrap_or(false);
+
+            // Call failed if: success=false OR error field is set
+            let call_failed = !call_success || has_error_field;
+
+            // Get error message from call or trace level
+            let error_msg = evm_call
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    evm_call
+                        .get("error_message")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
+
+            let mut new_entry = serde_json::json!({
                 "call_id": new_id,
                 "parent_call_id": new_parent,
                 "function": format!("[EVM] {}", func_name),
-                "file": "",
-                "line": 0,
+                "file": file,
+                "line": line,
                 "args": args_array,
                 "environment": "evm",
                 "contract_address": evm_call.get("contract_address").and_then(|v| v.as_str()).unwrap_or(""),
                 "gas_used": evm_call.get("gas_used"),
                 "return_data": evm_call.get("return_data"),
             });
+
+            // Add error fields if the call failed
+            if call_failed {
+                new_entry["error"] = serde_json::json!(true);
+                if let Some(ref msg) = error_msg {
+                    new_entry["error_message"] = serde_json::json!(msg);
+                }
+            }
+
             lldb_trace.push(new_entry);
         }
     }
 
-    let merged_json = serde_json::to_string_pretty(&lldb_trace)?;
+    // Determine final status based on cross-env trace results
+    let final_status = if any_trace_failed { "error" } else { "success" };
+
+    // Write back in new format with status, calls, and error_message for header
+    let mut output = serde_json::json!({
+        "status": final_status,
+        "calls": lldb_trace
+    });
+
+    // Add error_message at top level for header display
+    if let Some(ref msg) = first_error_message {
+        output["error_message"] = serde_json::json!(msg);
+    }
+
+    let merged_json = serde_json::to_string_pretty(&output)?;
     std::fs::write(lldb_trace_path, merged_json)?;
 
     let _ = std::fs::remove_file(cross_env_path);
@@ -459,6 +555,7 @@ async fn exec_inner(args: Args) -> eyre::Result<()> {
 
         let mut dbg_cmd = Command::new(cmd_name);
         dbg_cmd.args(cmd_args);
+        dbg_cmd.env("DEBUG_TRACE", "1");
 
         // Forward all original args and append child flag
         for a in std::env::args() {
@@ -523,4 +620,389 @@ async fn exec_inner(args: Args) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Helper to create a temporary JSON config file
+    fn create_temp_config(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file
+    }
+
+    #[test]
+    fn test_parse_solidity_contracts_single_evm_contract() {
+        let config = r#"{
+            "contracts": [
+                {
+                    "address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "environment": "evm",
+                    "name": "TestToken",
+                    "project_path": "/path/to/project",
+                    "debug_dir": "/path/to/debug"
+                }
+            ]
+        }"#;
+
+        let file = create_temp_config(config);
+        let result = parse_solidity_contracts(file.path()).unwrap();
+
+        assert_eq!(result.len(), 1);
+        let contract = result
+            .get("0x1234567890abcdef1234567890abcdef12345678")
+            .unwrap();
+        assert_eq!(contract.name, "TestToken");
+        assert_eq!(contract.environment, "evm");
+        assert_eq!(contract.project_path, "/path/to/project");
+        assert_eq!(contract.debug_dir, "/path/to/debug");
+    }
+
+    #[test]
+    fn test_parse_solidity_contracts_multiple_contracts() {
+        let config = r#"{
+            "contracts": [
+                {
+                    "address": "0xaaaa567890abcdef1234567890abcdef12345678",
+                    "environment": "evm",
+                    "name": "TokenA",
+                    "project_path": "/path/a",
+                    "debug_dir": "/debug/a"
+                },
+                {
+                    "address": "0xbbbb567890abcdef1234567890abcdef12345678",
+                    "environment": "evm",
+                    "name": "TokenB",
+                    "project_path": "/path/b",
+                    "debug_dir": "/debug/b"
+                },
+                {
+                    "address": "0xcccc567890abcdef1234567890abcdef12345678",
+                    "environment": "stylus",
+                    "name": "StylusContract",
+                    "project_path": "/path/c",
+                    "debug_dir": "/debug/c"
+                }
+            ]
+        }"#;
+
+        let file = create_temp_config(config);
+        let result = parse_solidity_contracts(file.path()).unwrap();
+
+        // Only EVM contracts should be included
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key("0xaaaa567890abcdef1234567890abcdef12345678"));
+        assert!(result.contains_key("0xbbbb567890abcdef1234567890abcdef12345678"));
+        // Stylus contract should be excluded
+        assert!(!result.contains_key("0xcccc567890abcdef1234567890abcdef12345678"));
+    }
+
+    #[test]
+    fn test_parse_solidity_contracts_missing_file() {
+        let result = parse_solidity_contracts(Path::new("/nonexistent/path/config.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_contract_config_to_solidity_contract_info() {
+        let config = ContractConfig {
+            address: "0x1234".to_string(),
+            environment: "evm".to_string(),
+            name: "TestContract".to_string(),
+            project_path: "/project/path".to_string(),
+            debug_dir: "/debug/dir".to_string(),
+        };
+
+        let info: soldb_bridge::SolidityContractInfo = config.into();
+
+        assert_eq!(info.name, "TestContract");
+        assert_eq!(info.debug_dir, "/debug/dir");
+        assert_eq!(info.project_path, Some("/project/path".to_string()));
+    }
+
+    #[test]
+    fn test_merge_cross_env_traces_no_cross_env_file() {
+        // Create a temporary LLDB trace file (format with status and calls)
+        let lldb_trace = r#"{
+            "status": "success",
+            "calls": [
+                {"call_id": 1, "function": "main", "file": "lib.rs", "line": 10, "args": []}
+            ]
+        }"#;
+
+        let lldb_file = NamedTempFile::new().unwrap();
+        std::fs::write(lldb_file.path(), lldb_trace).unwrap();
+
+        // Ensure cross-env file doesn't exist
+        let _ = std::fs::remove_file(hostio::CROSS_ENV_TRACES_PATH);
+
+        let result = merge_cross_env_traces(lldb_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Should return false when no cross-env file
+    }
+
+    #[test]
+    fn test_merge_cross_env_traces_empty_cross_env() {
+        let lldb_trace = r#"{
+            "status": "success",
+            "calls": [
+                {"call_id": 1, "function": "main", "file": "lib.rs", "line": 10, "args": []}
+            ]
+        }"#;
+
+        let lldb_file = NamedTempFile::new().unwrap();
+        std::fs::write(lldb_file.path(), lldb_trace).unwrap();
+
+        // Create empty cross-env traces file
+        std::fs::write(hostio::CROSS_ENV_TRACES_PATH, "[]").unwrap();
+
+        let result = merge_cross_env_traces(lldb_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Should return false when empty
+
+        // Cleanup
+        let _ = std::fs::remove_file(hostio::CROSS_ENV_TRACES_PATH);
+    }
+
+    #[test]
+    fn test_merge_cross_env_traces_with_evm_calls() {
+        let lldb_trace = r#"{
+            "status": "success",
+            "calls": [
+                {"call_id": 1, "parent_call_id": 0, "function": "user_entrypoint", "file": "lib.rs", "line": 1, "args": []},
+                {"call_id": 2, "parent_call_id": 1, "function": "IToken::new", "file": "lib.rs", "line": 10, "args": [{"name": "addr", "value": "0xabcd1234"}]},
+                {"call_id": 3, "parent_call_id": 1, "function": "IToken::transfer", "file": "lib.rs", "line": 15, "args": []}
+            ]
+        }"#;
+
+        let cross_env_trace = r#"[
+            {
+                "target_address": "0xabcd1234",
+                "calldata": "0xa9059cbb",
+                "call_type": "CALL",
+                "trace": {
+                    "trace_id": "test-123",
+                    "calls": [
+                        {
+                            "call_id": 1,
+                            "function_name": "transfer",
+                            "contract_address": "0xabcd1234",
+                            "environment": "evm",
+                            "call_type": "external",
+                            "success": true,
+                            "args": [
+                                {"name": "to", "type": "address", "value": "0x9999"},
+                                {"name": "amount", "type": "uint256", "value": "1000"}
+                            ]
+                        }
+                    ]
+                }
+            }
+        ]"#;
+
+        let lldb_file = NamedTempFile::new().unwrap();
+        std::fs::write(lldb_file.path(), lldb_trace).unwrap();
+        std::fs::write(hostio::CROSS_ENV_TRACES_PATH, cross_env_trace).unwrap();
+
+        let result = merge_cross_env_traces(lldb_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // Should return true when merged
+
+        // Verify merged content
+        let merged = std::fs::read_to_string(lldb_file.path()).unwrap();
+        let merged_parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let merged_json = merged_parsed.get("calls").unwrap().as_array().unwrap();
+
+        // Should have original 3 calls + 1 EVM call
+        assert_eq!(merged_json.len(), 4);
+
+        // Find the EVM call
+        let evm_call = merged_json
+            .iter()
+            .find(|c| {
+                c.get("function")
+                    .and_then(|f| f.as_str())
+                    .map(|f| f.starts_with("[EVM]"))
+                    .unwrap_or(false)
+            })
+            .unwrap();
+
+        assert_eq!(
+            evm_call.get("function").unwrap().as_str().unwrap(),
+            "[EVM] transfer"
+        );
+        assert_eq!(
+            evm_call.get("environment").unwrap().as_str().unwrap(),
+            "evm"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(hostio::CROSS_ENV_TRACES_PATH);
+    }
+
+    #[test]
+    fn test_merge_cross_env_traces_preserves_evm_hierarchy() {
+        let lldb_trace = r#"{
+            "status": "success",
+            "calls": [
+                {"call_id": 1, "parent_call_id": 0, "function": "main", "file": "lib.rs", "line": 1, "args": []}
+            ]
+        }"#;
+
+        // EVM trace with nested calls
+        let cross_env_trace = r#"[
+            {
+                "target_address": "0xtest1234",
+                "calldata": "0x",
+                "call_type": "CALL",
+                "trace": {
+                    "trace_id": "hierarchy-test",
+                    "calls": [
+                        {
+                            "call_id": 1,
+                            "function_name": "outerCall",
+                            "contract_address": "0xtest1234",
+                            "environment": "evm",
+                            "call_type": "external",
+                            "success": true,
+                            "args": []
+                        },
+                        {
+                            "call_id": 2,
+                            "parent_call_id": 1,
+                            "function_name": "innerCall",
+                            "contract_address": "0xtest5678",
+                            "environment": "evm",
+                            "call_type": "external",
+                            "success": true,
+                            "args": []
+                        }
+                    ]
+                }
+            }
+        ]"#;
+
+        let lldb_file = NamedTempFile::new().unwrap();
+        std::fs::write(lldb_file.path(), lldb_trace).unwrap();
+        std::fs::write(hostio::CROSS_ENV_TRACES_PATH, cross_env_trace).unwrap();
+
+        let result = merge_cross_env_traces(lldb_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        let merged = std::fs::read_to_string(lldb_file.path()).unwrap();
+        let merged_parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let merged_json = merged_parsed.get("calls").unwrap().as_array().unwrap();
+
+        // Should have 1 original + 2 EVM calls
+        assert_eq!(merged_json.len(), 3);
+
+        // Find outer and inner EVM calls
+        let outer = merged_json
+            .iter()
+            .find(|c| {
+                c.get("function")
+                    .and_then(|f| f.as_str())
+                    .map(|f| f.contains("outerCall"))
+                    .unwrap_or(false)
+            })
+            .unwrap();
+
+        let inner = merged_json
+            .iter()
+            .find(|c| {
+                c.get("function")
+                    .and_then(|f| f.as_str())
+                    .map(|f| f.contains("innerCall"))
+                    .unwrap_or(false)
+            })
+            .unwrap();
+
+        let outer_id = outer.get("call_id").unwrap().as_u64().unwrap();
+        let inner_parent = inner.get("parent_call_id").unwrap().as_u64().unwrap();
+
+        // Inner call's parent should be the outer call
+        assert_eq!(inner_parent, outer_id);
+
+        // Cleanup
+        let _ = std::fs::remove_file(hostio::CROSS_ENV_TRACES_PATH);
+    }
+
+    #[test]
+    fn test_merge_cross_env_traces_propagates_evm_errors() {
+        let lldb_trace = r#"{
+            "status": "success",
+            "calls": [
+                {"call_id": 1, "parent_call_id": 0, "function": "user_entrypoint", "file": "lib.rs", "line": 1, "args": []},
+                {"call_id": 2, "parent_call_id": 1, "function": "IToken::new", "file": "lib.rs", "line": 10, "args": [{"name": "addr", "value": "0xfailed1234"}]},
+                {"call_id": 3, "parent_call_id": 1, "function": "IToken::multiply", "file": "lib.rs", "line": 15, "args": []}
+            ]
+        }"#;
+
+        // EVM trace with a failed call
+        let cross_env_trace = r#"[
+            {
+                "target_address": "0xfailed1234",
+                "calldata": "0xa9059cbb",
+                "call_type": "CALL",
+                "trace": {
+                    "trace_id": "failed-trace",
+                    "success": false,
+                    "calls": [
+                        {
+                            "call_id": 1,
+                            "function_name": "multiply",
+                            "contract_address": "0xfailed1234",
+                            "environment": "evm",
+                            "call_type": "external",
+                            "success": false,
+                            "error": "Arithmetic overflow",
+                            "args": [
+                                {"name": "a", "type": "uint256", "value": "10"},
+                                {"name": "b", "type": "uint256", "value": "0"}
+                            ]
+                        }
+                    ]
+                }
+            }
+        ]"#;
+
+        let lldb_file = NamedTempFile::new().unwrap();
+        std::fs::write(lldb_file.path(), lldb_trace).unwrap();
+        std::fs::write(hostio::CROSS_ENV_TRACES_PATH, cross_env_trace).unwrap();
+
+        let result = merge_cross_env_traces(lldb_file.path().to_str().unwrap());
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // Should return true when merged
+
+        // Verify merged content
+        let merged = std::fs::read_to_string(lldb_file.path()).unwrap();
+        let merged_parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let merged_json = merged_parsed.get("calls").unwrap().as_array().unwrap();
+
+        // Find the EVM call
+        let evm_call = merged_json
+            .iter()
+            .find(|c| {
+                c.get("function")
+                    .and_then(|f| f.as_str())
+                    .map(|f| f.starts_with("[EVM]"))
+                    .unwrap_or(false)
+            })
+            .unwrap();
+
+        // Verify error fields are propagated
+        assert_eq!(evm_call.get("error").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            evm_call.get("error_message").unwrap().as_str().unwrap(),
+            "Arithmetic overflow"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(hostio::CROSS_ENV_TRACES_PATH);
+    }
 }

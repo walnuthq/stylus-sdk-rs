@@ -146,6 +146,9 @@ fn handle_solidity_call(
         None, // parent_call_id
     ) {
         Ok(Some(trace)) => {
+            // Check if the Solidity call reverted
+            let call_reverted = !trace.success;
+
             // Save trace for merging into /tmp/lldb_function_trace.json
             let entry = CrossEnvTraceEntry {
                 target_address: addr_str.clone(),
@@ -161,7 +164,8 @@ fn handle_solidity_call(
                 }
             }
 
-            Some(0)
+            // Return 0 for success, 1 for revert
+            Some(if call_reverted { 1 } else { 0 })
         }
         Ok(None) => {
             // Return success status anyway (trace not available but call succeeded)
