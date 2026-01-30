@@ -555,7 +555,6 @@ async fn exec_inner(args: Args) -> eyre::Result<()> {
 
         let mut dbg_cmd = Command::new(cmd_name);
         dbg_cmd.args(cmd_args);
-        dbg_cmd.env("DEBUG_TRACE", "1");
 
         // Forward all original args and append child flag
         for a in std::env::args() {
