@@ -19,14 +19,12 @@ use stylus_tools::{
 
 use crate::{
     common_args::{ProjectArgs, ProviderArgs, TraceArgs},
+    error::CargoStylusResult,
     utils::hostio::{self, ExternalContractAccess},
 };
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Whether to use stable Rust. Note that nightly is needed to expand macros.
-    #[arg(short, long)]
-    stable_rust: bool,
     /// Any features that should be passed to cargo build.
     #[arg(short, long)]
     features: Option<Vec<String>>,
@@ -75,15 +73,23 @@ struct ContractInfo {
     contract_type: ContractType,
 }
 
+/// A loaded shared library with its path for debug symbols
+struct LoadedLibrary {
+    /// The loaded library handle
+    library: libloading::Library,
+    /// Path to the library file (for debugger symbol loading)
+    path: PathBuf,
+}
+
 /// Registry for managing multiple contracts during debugging
 struct ContractRegistry {
     /// Mapping from contract address to contract info
     contracts: HashMap<Address, ContractInfo>,
-    /// Cached shared libraries for each contract address (only for Stylus contracts)
-    libraries: HashMap<Address, libloading::Library>,
-    /// Library paths for debug symbols (only for Stylus contracts)
-    library_paths: HashMap<Address, PathBuf>,
-    /// Solidity contract addresses explicitly marked via CLI
+    /// Cached shared libraries with their paths (only for Stylus contracts)
+    loaded_libraries: HashMap<Address, LoadedLibrary>,
+    /// Solidity contract addresses explicitly marked via CLI.
+    /// Reserved for future Solidity interop debugging support.
+    #[allow(dead_code)]
     solidity_contracts: HashSet<Address>,
 }
 
@@ -145,8 +151,7 @@ impl ContractRegistry {
 
         Ok(Self {
             contracts,
-            libraries: HashMap::new(),
-            library_paths: HashMap::new(),
+            loaded_libraries: HashMap::new(),
             solidity_contracts,
         })
     }
@@ -179,7 +184,7 @@ impl ContractRegistry {
                 return Ok(None);
             }
 
-            if !self.libraries.contains_key(address) {
+            if !self.loaded_libraries.contains_key(address) {
                 let library_extension = if cfg!(target_os = "macos") {
                     ".dylib"
                 } else {
@@ -195,12 +200,17 @@ impl ContractRegistry {
                             shared_library.display()
                         )
                     })?;
-                    self.libraries.insert(*address, lib);
-                    self.library_paths.insert(*address, shared_library);
+                    self.loaded_libraries.insert(
+                        *address,
+                        LoadedLibrary {
+                            library: lib,
+                            path: shared_library,
+                        },
+                    );
                 }
             }
 
-            Ok(self.libraries.get(address))
+            Ok(self.loaded_libraries.get(address).map(|l| &l.library))
         } else {
             Ok(None)
         }
@@ -213,15 +223,19 @@ impl ContractRegistry {
 
     /// Get an already-loaded library (assumes load_library was called earlier)
     fn get_loaded_library(&self, address: &Address) -> Option<&libloading::Library> {
-        self.libraries.get(address)
+        self.loaded_libraries.get(address).map(|l| &l.library)
     }
 
-    /// Get the type of a contract
+    /// Get the type of a contract.
+    /// Reserved for future Solidity interop debugging support.
+    #[allow(dead_code)]
     fn get_contract_type(&self, address: &Address) -> Option<ContractType> {
         self.contracts.get(address).map(|info| info.contract_type)
     }
 
-    /// Check if a contract is a Solidity contract
+    /// Check if a contract is a Solidity contract.
+    /// Reserved for future Solidity interop debugging support.
+    #[allow(dead_code)]
     fn is_solidity_contract(&self, address: &Address) -> bool {
         self.get_contract_type(address) == Some(ContractType::Solidity)
             || self.solidity_contracts.contains(address)
@@ -238,9 +252,9 @@ impl ContractRegistry {
 
     /// Get all contract debug info for debugger
     fn get_all_debug_info(&self) -> Vec<(Address, PathBuf)> {
-        self.library_paths
+        self.loaded_libraries
             .iter()
-            .map(|(addr, path)| (*addr, path.clone()))
+            .map(|(addr, loaded)| (*addr, loaded.path.clone()))
             .collect()
     }
 }
@@ -252,7 +266,8 @@ impl ExternalContractAccess for ContractRegistry {
         input_data: &[u8],
     ) -> Result<(u8, Vec<u8>), Box<dyn std::error::Error>> {
         // Check if we have a library loaded for this address
-        if let Some(lib) = self.libraries.get(address) {
+        if let Some(loaded) = self.loaded_libraries.get(address) {
+            let lib = &loaded.library;
             // Set up the input data for the external contract
             hostio::set_external_contract_input(input_data.to_vec());
 
@@ -310,7 +325,25 @@ pub fn build_shared_library(
 /// Find shared library in a specific path (for multi-contract support)
 fn find_shared_library_in_path(project: &Path, extension: &str) -> eyre::Result<PathBuf> {
     let triple = rustc_host::from_cli()?;
-    let so_dir = project.join(format!("target/{triple}/debug/"));
+
+    // Try project-local target first, then workspace root target
+    let local_target = project.join(format!("target/{triple}/debug/"));
+    let workspace_target =
+        find_workspace_root(project).map(|root| root.join(format!("target/{triple}/debug/")));
+
+    let so_dir = if local_target.exists() {
+        local_target
+    } else if let Some(ref ws_target) = workspace_target {
+        if ws_target.exists() {
+            ws_target.clone()
+        } else {
+            // Fall back to local for error message
+            local_target
+        }
+    } else {
+        local_target
+    };
+
     let so_dir = std::fs::read_dir(&so_dir)
         .map_err(|e| eyre!("failed to open {}: {e}", so_dir.to_string_lossy()))?
         .filter_map(|r| r.ok())
@@ -327,18 +360,40 @@ fn find_shared_library_in_path(project: &Path, extension: &str) -> eyre::Result<
         if ext.contains(extension) {
             if let Some(other) = file {
                 let other = other.file_name().unwrap().to_string_lossy();
-                bail!("more than one .so found: {ext} and {other}",);
+                bail!("more than one {extension} found: {ext} and {other}");
             }
             file = Some(entry);
         }
     }
     let Some(file) = file else {
-        bail!("failed to find .so");
+        bail!("failed to find {extension}");
     };
     Ok(file)
 }
 
-pub async fn exec(args: Args) -> eyre::Result<()> {
+/// Find the workspace root by looking for Cargo.toml with [workspace]
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        let cargo_toml = current.join("Cargo.toml");
+        if cargo_toml.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&cargo_toml) {
+                if contents.contains("[workspace]") {
+                    return Some(current);
+                }
+            }
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+pub async fn exec(args: Args) -> CargoStylusResult {
+    exec_inner(args).await.map_err(Into::into)
+}
+
+async fn exec_inner(args: Args) -> eyre::Result<()> {
     let macos = cfg!(target_os = "macos");
     if !args.child {
         // Build contract registry early to prepare debug commands
@@ -473,8 +528,12 @@ pub async fn exec(args: Args) -> eyre::Result<()> {
     }
 
     let provider = args.provider.build_provider().await?;
+    let tx = args
+        .trace
+        .tx
+        .ok_or_else(|| eyre::eyre!("missing tx hash - use --tx <HASH>"))?;
 
-    let trace = Trace::new(args.trace.tx, &args.trace.config, &provider).await?;
+    let trace = Trace::new(tx, &args.trace.config, &provider).await?;
 
     // Create contract registry and build all contracts
     let mut registry = ContractRegistry::new(args.contracts.clone(), args.addr_solidity.clone())?;
@@ -483,7 +542,7 @@ pub async fn exec(args: Args) -> eyre::Result<()> {
     if registry.contracts.is_empty() {
         let mut contracts = args.project.contracts()?;
         if contracts.len() != 1 {
-            bail!("cargo stylus trace can only be executed on one contract at a time when no --contracts flag is provided");
+            bail!("cargo stylus replay can only be executed on one contract at a time when no --contracts flag is provided");
         }
         let contract = contracts.pop().unwrap();
 
@@ -517,10 +576,13 @@ pub async fn exec(args: Args) -> eyre::Result<()> {
                     contract_type: ContractType::Stylus,
                 },
             );
-            registry.libraries.insert(contract_address, lib);
-            registry
-                .library_paths
-                .insert(contract_address, shared_library);
+            registry.loaded_libraries.insert(
+                contract_address,
+                LoadedLibrary {
+                    library: lib,
+                    path: shared_library,
+                },
+            );
         }
     } else {
         // Build all specified contracts
@@ -540,10 +602,28 @@ pub async fn exec(args: Args) -> eyre::Result<()> {
         .ok_or_else(|| eyre!("Transaction has no 'to' address"))?;
 
     if !registry.has_source(&contract_address) {
-        bail!(
-            "Main contract at {} has no source code provided. Use --contracts flag.",
-            contract_address
-        );
+        if args.contracts.is_some() {
+            let provided_addresses: Vec<String> = registry
+                .contracts
+                .keys()
+                .map(|addr| format!("{}", addr))
+                .collect();
+            bail!(
+                "Main contract at {} is not in the provided --contracts list.\n\
+                 Provided addresses: [{}]\n\
+                 Add the main contract: --contracts {}:<PATH_TO_SOURCE>",
+                contract_address,
+                provided_addresses.join(", "),
+                contract_address
+            );
+        } else {
+            bail!(
+                "Main contract at {} has no source code provided. Use --contracts flag:\n\
+                 --contracts {}:<PATH_TO_SOURCE>",
+                contract_address,
+                contract_address
+            );
+        }
     }
 
     // Initialize debugger hook if using stylusdb
@@ -614,13 +694,13 @@ pub fn find_shared_library(project: &Path, extension: &str) -> eyre::Result<Path
         if ext.contains(extension) {
             if let Some(other) = file {
                 let other = other.file_name().unwrap().to_string_lossy();
-                bail!("more than one .so found: {ext} and {other}",);
+                bail!("more than one {extension} found: {ext} and {other}");
             }
             file = Some(entry);
         }
     }
     let Some(file) = file else {
-        bail!("failed to find .so");
+        bail!("failed to find {extension}");
     };
     Ok(file)
 }
