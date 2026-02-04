@@ -19,8 +19,11 @@ pub async fn deploy_fragments(
     let from_address = provider.default_signer_address();
     let mut addresses = Vec::new();
     for fragment in fragments.as_slice() {
-        let req =
-            DeploymentRequest::new(from_address, fragment.as_slice(), config.max_fee_per_gas_gwei);
+        let req = DeploymentRequest::new(
+            from_address,
+            fragment.as_slice(),
+            config.max_fee_per_gas_gwei,
+        );
         let receipt = req.exec(&provider).await?;
         let address = receipt
             .contract_address
@@ -44,8 +47,11 @@ pub async fn estimate_fragments_gas(
     let from_address = provider.default_signer_address();
     let mut gas = 0;
     for fragment in fragments.as_slice() {
-        let req =
-            DeploymentRequest::new(from_address, fragment.as_slice(), config.max_fee_per_gas_gwei);
+        let req = DeploymentRequest::new(
+            from_address,
+            fragment.as_slice(),
+            config.max_fee_per_gas_gwei,
+        );
         gas += req.estimate_gas(provider).await?;
     }
     Ok(gas)

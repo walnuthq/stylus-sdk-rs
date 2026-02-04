@@ -114,7 +114,8 @@ pub async fn data_fee(
         Code::Fragments(fragments) => {
             let fragment_addresses = fragments.as_slice().iter().map(|fragment| {
                 let fragment_address = Address::random();
-                let fragment_code = AccountOverride::default().with_code(fragment.as_slice().to_vec());
+                let fragment_code =
+                    AccountOverride::default().with_code(fragment.as_slice().to_vec());
                 state_override.push((fragment_address, fragment_code));
                 fragment_address
             });
@@ -122,7 +123,9 @@ pub async fn data_fee(
                 fragments.uncompressed_wasm_size(),
                 fragment_addresses,
             );
-            let spoofed_code = AccountOverride::default().with_code(root_contract.as_slice().to_vec());
+
+            let spoofed_code =
+                AccountOverride::default().with_code(root_contract.as_slice().to_vec());
             state_override.push((address, spoofed_code));
         }
     }
