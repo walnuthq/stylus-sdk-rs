@@ -20,7 +20,7 @@ pub async fn deploy_fragments(
     let mut addresses = Vec::new();
     for fragment in fragments.as_slice() {
         let req =
-            DeploymentRequest::new(from_address, fragment.bytes(), config.max_fee_per_gas_gwei);
+            DeploymentRequest::new(from_address, fragment.as_slice(), config.max_fee_per_gas_gwei);
         let receipt = req.exec(&provider).await?;
         let address = receipt
             .contract_address
@@ -45,7 +45,7 @@ pub async fn estimate_fragments_gas(
     let mut gas = 0;
     for fragment in fragments.as_slice() {
         let req =
-            DeploymentRequest::new(from_address, fragment.bytes(), config.max_fee_per_gas_gwei);
+            DeploymentRequest::new(from_address, fragment.as_slice(), config.max_fee_per_gas_gwei);
         gas += req.estimate_gas(provider).await?;
     }
     Ok(gas)
@@ -63,6 +63,6 @@ pub async fn estimate_root_contract_gas(
         uncompressed_code_size,
         fragments.as_slice().iter().map(|_| Address::ZERO),
     );
-    let req = DeploymentRequest::new(from_address, root.bytes(), config.max_fee_per_gas_gwei);
+    let req = DeploymentRequest::new(from_address, root.as_slice(), config.max_fee_per_gas_gwei);
     req.estimate_gas(provider).await
 }

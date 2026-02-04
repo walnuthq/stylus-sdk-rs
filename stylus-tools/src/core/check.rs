@@ -95,12 +95,13 @@ pub async fn check_wasm_file(
     // Check if the contract already exists
     // TODO: check log
     debug!(@grey, "connecting to RPC: {:?}", provider.root());
-    let codehash = code.codehash();
-    if Contract::exists(codehash, &provider).await? {
-        return Ok(ContractStatus::Active {
-            code,
-            wasm: processed,
-        });
+    if let Some(codehash) = code.codehash() {
+        if Contract::exists(codehash, &provider).await? {
+            return Ok(ContractStatus::Active {
+                code,
+                wasm: processed,
+            });
+        }
     }
 
     let contract_address = contract_address.unwrap_or_else(Address::random);

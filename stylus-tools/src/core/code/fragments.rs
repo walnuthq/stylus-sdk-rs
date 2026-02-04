@@ -3,8 +3,6 @@
 
 //! Support for fragmented Stylus contracts
 
-use alloy::primitives::{keccak256, B256};
-
 use crate::core::code::{prefixes, wasm::CompressedWasm};
 
 /// Fragmented code, with the appropriate prefix bytes
@@ -21,7 +19,7 @@ impl CodeFragment {
     }
 
     /// Get code bytes for this fragment
-    pub fn bytes(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
 }
@@ -51,16 +49,6 @@ impl CodeFragments {
     /// Get a slice containing all fragments
     pub fn as_slice(&self) -> &[CodeFragment] {
         &self.fragments
-    }
-
-    /// Codehash is hash of all fragments together
-    pub fn codehash(&self) -> B256 {
-        keccak256(
-            self.fragments
-                .iter()
-                .flat_map(|f| f.0.iter().cloned())
-                .collect::<Vec<_>>(),
-        )
     }
 
     /// Length of all code chunks together

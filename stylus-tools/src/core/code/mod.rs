@@ -1,4 +1,4 @@
-// Copyright 2025, Offchain Labs, Inc.
+// Copyright 2026, Offchain Labs, Inc.
 // For licensing, see https://github.com/OffchainLabs/stylus-sdk-rs/blob/main/licenses/COPYRIGHT.md
 
 //! Tagged WASM code, already processed and ready to be uploaded on-chain
@@ -71,11 +71,11 @@ impl Code {
         Self::Contract(contract::ContractCode::new_from_code(code))
     }
 
-    /// Get codehash of contract or fragments
-    pub fn codehash(&self) -> B256 {
+    /// Get codehash of contract
+    pub fn codehash(&self) -> Option<B256> {
         match self {
-            Self::Contract(contract) => contract.codehash(),
-            Self::Fragments(fragments) => fragments.codehash(),
+            Self::Contract(contract) => Some(contract.codehash()),
+            Self::Fragments(_) => None,
         }
     }
 }

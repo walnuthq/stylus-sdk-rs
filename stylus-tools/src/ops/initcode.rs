@@ -39,7 +39,7 @@ pub fn write_initcode(
             ));
         }
     };
-    let initcode = DeploymentCalldata::new(contract.bytes());
+    let initcode = DeploymentCalldata::new(contract.as_slice());
     output.write_all(hex::encode(initcode.0).as_bytes())?;
     Ok(())
 }

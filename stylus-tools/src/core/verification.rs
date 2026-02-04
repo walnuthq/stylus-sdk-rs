@@ -47,7 +47,7 @@ pub async fn verify(
     }
     let status = contract.check(None, &Default::default(), provider).await?;
     let deployment_data = match status.code() {
-        Code::Contract(contract) => DeploymentCalldata::new(contract.bytes()),
+        Code::Contract(contract) => DeploymentCalldata::new(contract.as_slice()),
         Code::Fragments(_fragments) => todo!("support fragments for verification"),
     };
 

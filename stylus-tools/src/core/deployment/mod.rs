@@ -47,7 +47,7 @@ pub async fn estimate_gas(
     let mut gas = match status.code() {
         Code::Contract(contract) => {
             let req =
-                DeploymentRequest::new(from_address, contract.bytes(), config.max_fee_per_gas_gwei);
+                DeploymentRequest::new(from_address, contract.as_slice(), config.max_fee_per_gas_gwei);
             req.estimate_gas(provider).await?
         }
         Code::Fragments(fragments) => {
@@ -91,7 +91,7 @@ pub async fn estimate_gas_wasm_file(
     let mut gas = match status.code() {
         Code::Contract(contract) => {
             let req =
-                DeploymentRequest::new(from_address, contract.bytes(), config.max_fee_per_gas_gwei);
+                DeploymentRequest::new(from_address, contract.as_slice(), config.max_fee_per_gas_gwei);
             req.estimate_gas(provider).await?
         }
         Code::Fragments(fragments) => {
@@ -166,13 +166,13 @@ pub async fn deploy(
     let req = match &constructor {
         None => match status.code() {
             Code::Contract(contract) => {
-                DeploymentRequest::new(from_address, contract.bytes(), config.max_fee_per_gas_gwei)
+                DeploymentRequest::new(from_address, contract.as_slice(), config.max_fee_per_gas_gwei)
             }
             Code::Fragments(fragments) => {
                 let root =
                     deploy_fragments(fragments, status.wasm().len() as u32, config, provider)
                         .await?;
-                DeploymentRequest::new(from_address, root.bytes(), config.max_fee_per_gas_gwei)
+                DeploymentRequest::new(from_address, root.as_slice(), config.max_fee_per_gas_gwei)
             }
         },
         Some(constructor) => {
@@ -301,12 +301,12 @@ pub async fn deploy_wasm_file(
     }
     let req = match status.code() {
         Code::Contract(contract) => {
-            DeploymentRequest::new(from_address, contract.bytes(), config.max_fee_per_gas_gwei)
+            DeploymentRequest::new(from_address, contract.as_slice(), config.max_fee_per_gas_gwei)
         }
         Code::Fragments(fragments) => {
             let root =
                 deploy_fragments(fragments, status.wasm().len() as u32, config, provider).await?;
-            DeploymentRequest::new(from_address, root.bytes(), config.max_fee_per_gas_gwei)
+            DeploymentRequest::new(from_address, root.as_slice(), config.max_fee_per_gas_gwei)
         }
     };
 
